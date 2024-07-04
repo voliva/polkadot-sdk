@@ -201,12 +201,7 @@ impl<T: Config<I>, I: 'static> fungible::Mutate<T::AccountId> for Pallet<T, I> {
 	fn done_restore(who: &T::AccountId, amount: Self::Balance) {
 		Self::deposit_event(Event::<T, I>::Restored { who: who.clone(), amount });
 	}
-	fn done_transfer(source: &T::AccountId, dest: &T::AccountId, amount: Self::Balance) {
-		Self::deposit_event(Event::<T, I>::Transfer {
-			from: source.clone(),
-			to: dest.clone(),
-			amount,
-		});
+	fn done_transfer(_source: &T::AccountId, _dest: &T::AccountId, _amount: Self::Balance) {
 	}
 }
 

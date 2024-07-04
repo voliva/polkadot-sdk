@@ -159,7 +159,7 @@ use frame_support::{
 			fungible, BalanceStatus as Status, DepositConsequence,
 			Fortitude::{self, Force, Polite},
 			IdAmount,
-			Preservation::{Expendable, Preserve, Protect},
+			Preservation::{self, Expendable, Preserve, Protect},
 			WithdrawConsequence,
 		},
 		Currency, Defensive, Get, OnUnbalanced, ReservableCurrency, StoredMap,
@@ -329,6 +329,13 @@ pub mod pallet {
 		DustLost { account: T::AccountId, amount: T::Balance },
 		/// Transfer succeeded.
 		Transfer { from: T::AccountId, to: T::AccountId, amount: T::Balance },
+		/// Transfer succeeded with comment.
+		TransferWithComment {
+			from: T::AccountId,
+			to: T::AccountId,
+			amount: T::Balance,
+			comment: Vec<u8>,
+		},
 		/// A balance was set by root.
 		BalanceSet { who: T::AccountId, free: T::Balance },
 		/// Some balance was reserved (moved from free to reserved).
@@ -594,10 +601,11 @@ pub mod pallet {
 			origin: OriginFor<T>,
 			dest: AccountIdLookupOf<T>,
 			#[pallet::compact] value: T::Balance,
+			comment: Option<Vec<u8>>,
 		) -> DispatchResult {
 			let source = ensure_signed(origin)?;
 			let dest = T::Lookup::lookup(dest)?;
-			<Self as fungible::Mutate<_>>::transfer(&source, &dest, value, Expendable)?;
+			Self::perform_transfer(&source, &dest, value, Expendable, comment)?;
 			Ok(())
 		}
 
@@ -613,7 +621,7 @@ pub mod pallet {
 			ensure_root(origin)?;
 			let source = T::Lookup::lookup(source)?;
 			let dest = T::Lookup::lookup(dest)?;
-			<Self as fungible::Mutate<_>>::transfer(&source, &dest, value, Expendable)?;
+			Self::perform_transfer(&source, &dest, value, Expendable, None)?;
 			Ok(())
 		}
 
@@ -628,10 +636,11 @@ pub mod pallet {
 			origin: OriginFor<T>,
 			dest: AccountIdLookupOf<T>,
 			#[pallet::compact] value: T::Balance,
+			comment: Option<Vec<u8>>,
 		) -> DispatchResult {
 			let source = ensure_signed(origin)?;
 			let dest = T::Lookup::lookup(dest)?;
-			<Self as fungible::Mutate<_>>::transfer(&source, &dest, value, Preserve)?;
+			Self::perform_transfer(&source, &dest, value, Preserve, comment)?;
 			Ok(())
 		}
 
@@ -664,12 +673,7 @@ pub mod pallet {
 				Fortitude::Polite,
 			);
 			let dest = T::Lookup::lookup(dest)?;
-			<Self as fungible::Mutate<_>>::transfer(
-				&transactor,
-				&dest,
-				reducible_balance,
-				keep_alive,
-			)?;
+			Self::perform_transfer(&transactor, &dest, reducible_balance, keep_alive, None)?;
 			Ok(())
 		}
 
@@ -819,6 +823,30 @@ pub mod pallet {
 	}
 
 	impl<T: Config<I>, I: 'static> Pallet<T, I> {
+		fn perform_transfer(
+			source: &T::AccountId,
+			dest: &T::AccountId,
+			amount: T::Balance,
+			preservation: Preservation,
+			comment: Option<Vec<u8>>,
+		) -> Result<T::Balance, DispatchError> {
+			let result =
+				<Self as fungible::Mutate<_>>::transfer(&source, &dest, amount, preservation)?;
+
+			Self::deposit_event(if let Some(comment) = comment {
+				Event::<T, I>::TransferWithComment {
+					from: source.clone(),
+					to: dest.clone(),
+					amount,
+					comment,
+				}
+			} else {
+				Event::<T, I>::Transfer { from: source.clone(), to: dest.clone(), amount }
+			});
+
+			Ok(result)
+		}
+
 		fn ed() -> T::Balance {
 			T::ExistentialDeposit::get()
 		}
