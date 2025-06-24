@@ -192,6 +192,10 @@ where
 		Ok(self.pool.ready().map(|tx| tx.data().encode().into()).collect())
 	}
 
+	fn future_extrinsics(&self) -> Result<Vec<Bytes>> {
+		Ok(self.pool.futures().into_iter().map(|tx| tx.data().encode().into()).collect())
+	}
+
 	async fn remove_extrinsic(
 		&self,
 		ext: &Extensions,

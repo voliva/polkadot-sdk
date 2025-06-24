@@ -82,6 +82,10 @@ pub trait AuthorApi<Hash, BlockHash> {
 	#[method(name = "author_pendingExtrinsics")]
 	fn pending_extrinsics(&self) -> Result<Vec<Bytes>, Error>;
 
+	/// Returns all future extrinsics, potentially grouped by sender.
+	#[method(name = "author_futureExtrinsics")]
+	fn future_extrinsics(&self) -> Result<Vec<Bytes>, Error>;
+
 	/// Remove given extrinsic from the pool and temporarily ban it to prevent reimporting.
 	#[method(name = "author_removeExtrinsic", with_extensions)]
 	async fn remove_extrinsic(
