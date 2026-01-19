@@ -22,13 +22,18 @@
 
 use crate::{
 	common::tracing_log_xt::log_xt_trace,
-	fork_aware_txpool::{stream_map_util::next_event, view::TransactionStatusEvent},
+	fork_aware_txpool::{
+		stream_map_util::next_event, view::TransactionStatusEvent as ViewTransactionStatusEvent,
+	},
 	graph::{self, BlockHash, ExtrinsicHash},
 	LOG_TARGET,
 };
-use futures::{Future, FutureExt, Stream, StreamExt};
+use futures::{channel::mpsc::channel, Future, FutureExt, Stream, StreamExt};
 use parking_lot::RwLock;
-use sc_transaction_pool_api::{TransactionStatus, TransactionStatusStream, TxIndex};
+use sc_transaction_pool_api::{
+	TransactionStatus, TransactionStatusEvent, TransactionStatusEventStream,
+	TransactionStatusStream, TxIndex,
+};
 use sc_utils::mpsc;
 use sp_runtime::traits::Block as BlockT;
 use std::{
@@ -55,6 +60,11 @@ type Controller<T> = mpsc::TracingUnboundedSender<T>;
 /// Lives within the [`ExternalWatcherContext`] instance.
 type CommandReceiver<T> = mpsc::TracingUnboundedReceiver<T>;
 
+/// Sender for pool-wide transaction status event streams.
+type StatusEventSink<ChainApi> = futures::channel::mpsc::Sender<
+	TransactionStatusEvent<ExtrinsicHash<ChainApi>, BlockHash<ChainApi>>,
+>;
+
 /// The stream of the transaction events.
 ///
 /// It can represent both a single view's stream and an external watcher stream.
@@ -65,7 +75,7 @@ pub type TxStatusStream<T> = Pin<Box<TransactionStatusStream<ExtrinsicHash<T>, B
 /// This stream delivers updates for all transactions in the view, rather than for individual
 /// transactions.
 pub type ViewStatusStream<T> =
-	Pin<Box<dyn Stream<Item = TransactionStatusEvent<ExtrinsicHash<T>, BlockHash<T>>> + Send>>;
+	Pin<Box<dyn Stream<Item = ViewTransactionStatusEvent<ExtrinsicHash<T>, BlockHash<T>>> + Send>>;
 
 /// Commands to control / drive the task of the multi view listener.
 enum ControllerCommand<ChainApi: graph::ChainApi> {
@@ -113,10 +123,10 @@ where
 {
 	fn hash(&self) -> ExtrinsicHash<ChainApi> {
 		match self {
-			Self::Invalidated(hash) |
-			Self::Finalized(hash, _, _) |
-			Self::Broadcasted(hash, _) |
-			Self::Dropped(hash, _) => *hash,
+			Self::Invalidated(hash)
+			| Self::Finalized(hash, _, _)
+			| Self::Broadcasted(hash, _)
+			| Self::Dropped(hash, _) => *hash,
 			Self::FinalityTimeout(hash, _) => *hash,
 		}
 	}
@@ -130,18 +140,24 @@ where
 	fn into(self) -> TransactionStatus<ExtrinsicHash<ChainApi>, BlockHash<ChainApi>> {
 		match self {
 			TransactionStatusUpdate::Invalidated(_) => TransactionStatus::Invalid,
-			TransactionStatusUpdate::Finalized(_, hash, index) =>
-				TransactionStatus::Finalized((*hash, *index)),
-			TransactionStatusUpdate::Broadcasted(_, peers) =>
-				TransactionStatus::Broadcast(peers.clone()),
-			TransactionStatusUpdate::Dropped(_, DroppedReason::Usurped(by)) =>
-				TransactionStatus::Usurped(*by),
-			TransactionStatusUpdate::Dropped(_, DroppedReason::LimitsEnforced) =>
-				TransactionStatus::Dropped,
-			TransactionStatusUpdate::Dropped(_, DroppedReason::Invalid) =>
-				TransactionStatus::Invalid,
-			TransactionStatusUpdate::FinalityTimeout(_, block_hash) =>
-				TransactionStatus::FinalityTimeout(*block_hash),
+			TransactionStatusUpdate::Finalized(_, hash, index) => {
+				TransactionStatus::Finalized((*hash, *index))
+			},
+			TransactionStatusUpdate::Broadcasted(_, peers) => {
+				TransactionStatus::Broadcast(peers.clone())
+			},
+			TransactionStatusUpdate::Dropped(_, DroppedReason::Usurped(by)) => {
+				TransactionStatus::Usurped(*by)
+			},
+			TransactionStatusUpdate::Dropped(_, DroppedReason::LimitsEnforced) => {
+				TransactionStatus::Dropped
+			},
+			TransactionStatusUpdate::Dropped(_, DroppedReason::Invalid) => {
+				TransactionStatus::Invalid
+			},
+			TransactionStatusUpdate::FinalityTimeout(_, block_hash) => {
+				TransactionStatus::FinalityTimeout(*block_hash)
+			},
 		}
 	}
 }
@@ -235,6 +251,24 @@ where
 	}
 }
 
+fn notify_status_sinks<ChainApi>(
+	sinks: &Arc<RwLock<Vec<StatusEventSink<ChainApi>>>>,
+	tx_hash: ExtrinsicHash<ChainApi>,
+	status: TransactionStatus<ExtrinsicHash<ChainApi>, BlockHash<ChainApi>>,
+) where
+	ChainApi: graph::ChainApi,
+{
+	let event = TransactionStatusEvent { hash: tx_hash, status };
+	sinks.write().retain_mut(|sink| {
+		if let Err(error) = sink.try_send(event.clone()) {
+			trace!(target: LOG_TARGET, ?tx_hash, ?error, "status_stream send failed");
+			false
+		} else {
+			true
+		}
+	});
+}
+
 /// This struct allows to create and control listener for multiple transactions.
 ///
 /// For every view, an aggregated stream of transactions events can be added. The events are
@@ -255,6 +289,9 @@ pub struct MultiViewListener<ChainApi: graph::ChainApi> {
 	/// shared with listener's task.
 	external_controllers:
 		Arc<RwLock<HashMap<ExtrinsicHash<ChainApi>, Controller<ExternalWatcherCommand<ChainApi>>>>>,
+
+	/// The list of external sinks receiving pool-wide transaction status updates.
+	external_status_sinks: Arc<RwLock<Vec<StatusEventSink<ChainApi>>>>,
 }
 
 /// A type representing a `MultiViewListener` task. For more details refer to
@@ -266,11 +303,9 @@ pub type MultiViewListenerTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 /// This context is used to unfold the external events stream for a individual transaction, it
 /// facilitates the logic of converting events incoming from numerous views into the external events
 /// stream.
-struct ExternalWatcherContext<ChainApi: graph::ChainApi> {
+struct ExternalWatcherState<ChainApi: graph::ChainApi> {
 	/// The hash of the transaction being monitored within this context.
 	tx_hash: ExtrinsicHash<ChainApi>,
-	/// A receiver for controller commands sent by [`MultiViewListener`]'s task.
-	command_receiver: CommandReceiver<ExternalWatcherCommand<ChainApi>>,
 	/// A flag indicating whether the context should terminate.
 	terminate: bool,
 	/// A flag indicating if a `Future` status has been encountered.
@@ -282,6 +317,18 @@ struct ExternalWatcherContext<ChainApi: graph::ChainApi> {
 	/// The set of views (represented by block hashes) currently maintained by the transaction
 	/// pool.
 	known_views: HashSet<BlockHash<ChainApi>>,
+}
+
+/// The external stream unfolding context.
+///
+/// This context is used to unfold the external events stream for a individual transaction, it
+/// facilitates the logic of converting events incoming from numerous views into the external events
+/// stream.
+struct ExternalWatcherContext<ChainApi: graph::ChainApi> {
+	/// The internal state tracking transaction status across views.
+	state: ExternalWatcherState<ChainApi>,
+	/// A receiver for controller commands sent by [`MultiViewListener`]'s task.
+	command_receiver: CommandReceiver<ExternalWatcherCommand<ChainApi>>,
 }
 
 /// Commands to control the single external stream living within the multi view listener. These
@@ -300,21 +347,14 @@ enum ExternalWatcherCommand<ChainApi: graph::ChainApi> {
 	RemoveView(BlockHash<ChainApi>),
 }
 
-impl<ChainApi: graph::ChainApi> ExternalWatcherContext<ChainApi>
+impl<ChainApi: graph::ChainApi> ExternalWatcherState<ChainApi>
 where
 	<<ChainApi as graph::ChainApi>::Block as BlockT>::Hash: Unpin,
 {
-	/// Creates new `ExternalWatcherContext` for particular transaction identified by `tx_hash`
-	///
-	/// The `command_receiver` is a side channel for receiving controller's
-	/// [commands][`ExternalWatcherCommand`].
-	fn new(
-		tx_hash: ExtrinsicHash<ChainApi>,
-		command_receiver: CommandReceiver<ExternalWatcherCommand<ChainApi>>,
-	) -> Self {
+	/// Creates new `ExternalWatcherState` for particular transaction identified by `tx_hash`.
+	fn new(tx_hash: ExtrinsicHash<ChainApi>) -> Self {
 		Self {
 			tx_hash,
-			command_receiver,
 			terminate: false,
 			future_seen: false,
 			ready_seen: false,
@@ -329,13 +369,25 @@ where
 	/// Function may set the context termination flag, which will close the stream.
 	///
 	/// Returns `Some` with the `event` to be sent out or `None`.
+	fn handle_pool_status(
+		&mut self,
+		status: TransactionStatus<ExtrinsicHash<ChainApi>, BlockHash<ChainApi>>,
+	) -> Option<TransactionStatus<ExtrinsicHash<ChainApi>, BlockHash<ChainApi>>> {
+		status.is_final().then(|| self.terminate = true);
+		Some(status)
+	}
+
+	/// Handles transaction status updates from the pool and manages internal states based on the
+	/// input value.
+	///
+	/// Function may set the context termination flag, which will close the stream.
+	///
+	/// Returns `Some` with the `event` to be sent out or `None`.
 	fn handle_pool_transaction_status(
 		&mut self,
-		request: TransactionStatusUpdate<ChainApi>,
+		request: &TransactionStatusUpdate<ChainApi>,
 	) -> Option<TransactionStatus<ExtrinsicHash<ChainApi>, BlockHash<ChainApi>>> {
-		let status = Into::<TransactionStatus<_, _>>::into(&request);
-		status.is_final().then(|| self.terminate = true);
-		return Some(status);
+		self.handle_pool_status(Into::<TransactionStatus<_, _>>::into(request))
 	}
 
 	/// Handles various transaction status updates from individual views and manages internal states
@@ -390,12 +442,12 @@ where
 				self.terminate = true;
 				Some(status)
 			},
-			TransactionStatus::FinalityTimeout(_) |
-			TransactionStatus::Retracted(_) |
-			TransactionStatus::Broadcast(_) |
-			TransactionStatus::Usurped(_) |
-			TransactionStatus::Dropped |
-			TransactionStatus::Invalid => None,
+			TransactionStatus::FinalityTimeout(_)
+			| TransactionStatus::Retracted(_)
+			| TransactionStatus::Broadcast(_)
+			| TransactionStatus::Usurped(_)
+			| TransactionStatus::Dropped
+			| TransactionStatus::Invalid => None,
 		}
 	}
 
@@ -431,6 +483,22 @@ where
 	}
 }
 
+impl<ChainApi: graph::ChainApi> ExternalWatcherContext<ChainApi>
+where
+	<<ChainApi as graph::ChainApi>::Block as BlockT>::Hash: Unpin,
+{
+	/// Creates new `ExternalWatcherContext` for particular transaction identified by `tx_hash`
+	///
+	/// The `command_receiver` is a side channel for receiving controller's
+	/// [commands][`ExternalWatcherCommand`].
+	fn new(
+		tx_hash: ExtrinsicHash<ChainApi>,
+		command_receiver: CommandReceiver<ExternalWatcherCommand<ChainApi>>,
+	) -> Self {
+		Self { state: ExternalWatcherState::new(tx_hash), command_receiver }
+	}
+}
+
 impl<ChainApi> MultiViewListener<ChainApi>
 where
 	ChainApi: graph::ChainApi + 'static,
@@ -451,16 +519,22 @@ where
 		external_watchers_tx_hash_map: Arc<
 			RwLock<HashMap<ExtrinsicHash<ChainApi>, Controller<ExternalWatcherCommand<ChainApi>>>>,
 		>,
+		external_status_sinks: Arc<RwLock<Vec<StatusEventSink<ChainApi>>>>,
 		mut command_receiver: CommandReceiver<ControllerCommand<ChainApi>>,
 		events_metrics_collector: EventsMetricsCollector<ChainApi>,
 	) {
 		let mut aggregated_streams_map: StreamMap<BlockHash<ChainApi>, ViewStatusStream<ChainApi>> =
 			Default::default();
+		let mut global_status_contexts: HashMap<
+			ExtrinsicHash<ChainApi>,
+			ExternalWatcherState<ChainApi>,
+		> = Default::default();
 
 		loop {
 			tokio::select! {
 				biased;
 				Some((view_hash, (tx_hash, status))) =  next_event(&mut aggregated_streams_map) => {
+					let status_for_global = status.clone();
 					events_metrics_collector.report_status(tx_hash, status.clone());
 					if let Entry::Occupied(mut ctrl) = external_watchers_tx_hash_map.write().entry(tx_hash) {
 						trace!(
@@ -478,11 +552,31 @@ where
 							ctrl.remove();
 						}
 					}
+					if external_status_sinks.read().is_empty() {
+						global_status_contexts.clear();
+					} else {
+						let ctx = global_status_contexts
+							.entry(tx_hash)
+							.or_insert_with(|| ExternalWatcherState::new(tx_hash));
+						if let Some(new_status) =
+							ctx.handle_view_transaction_status(view_hash, status_for_global)
+						{
+							notify_status_sinks::<ChainApi>(&external_status_sinks, tx_hash, new_status);
+						}
+						if ctx.terminate {
+							global_status_contexts.remove(&tx_hash);
+						}
+					}
 				},
 				cmd = command_receiver.next() => {
 					match cmd {
 						Some(ControllerCommand::AddViewStream(h,stream)) => {
 							aggregated_streams_map.insert(h,stream);
+							if external_status_sinks.read().is_empty() {
+								global_status_contexts.clear();
+							} else {
+								global_status_contexts.values_mut().for_each(|ctx| ctx.add_view(h));
+							}
 							// //todo: aysnc and join all?
 							external_watchers_tx_hash_map.write().retain(|tx_hash, ctrl| {
 								ctrl.unbounded_send(ExternalWatcherCommand::AddView(h))
@@ -494,6 +588,11 @@ where
 						},
 						Some(ControllerCommand::RemoveViewStream(h)) => {
 							aggregated_streams_map.remove(&h);
+							if external_status_sinks.read().is_empty() {
+								global_status_contexts.clear();
+							} else {
+								global_status_contexts.values_mut().for_each(|ctx| ctx.remove_view(h));
+							}
 							//todo: aysnc and join all?
 							external_watchers_tx_hash_map.write().retain(|tx_hash, ctrl| {
 								ctrl.unbounded_send(ExternalWatcherCommand::RemoveView(h))
@@ -506,7 +605,21 @@ where
 
 						Some(ControllerCommand::TransactionStatusRequest(request)) => {
 							let tx_hash = request.hash();
-							events_metrics_collector.report_status(tx_hash, (&request).into());
+							let status = Into::<TransactionStatus<_, _>>::into(&request);
+							events_metrics_collector.report_status(tx_hash, status.clone());
+							if external_status_sinks.read().is_empty() {
+								global_status_contexts.clear();
+							} else {
+								let ctx = global_status_contexts
+									.entry(tx_hash)
+									.or_insert_with(|| ExternalWatcherState::new(tx_hash));
+								if let Some(new_status) = ctx.handle_pool_status(status) {
+									notify_status_sinks::<ChainApi>(&external_status_sinks, tx_hash, new_status);
+								}
+								if ctx.terminate {
+									global_status_contexts.remove(&tx_hash);
+								}
+							}
 							if let Entry::Occupied(mut ctrl) = external_watchers_tx_hash_map.write().entry(tx_hash) {
 								if let Err(error) = ctrl
 									.get_mut()
@@ -543,15 +656,21 @@ where
 			ExtrinsicHash<ChainApi>,
 			Controller<ExternalWatcherCommand<ChainApi>>,
 		>::default()));
+		let external_status_sinks = Arc::from(RwLock::from(Vec::new()));
 
 		const CONTROLLER_QUEUE_WARN_SIZE: usize = 100_000;
 		let (tx, rx) = mpsc::tracing_unbounded(
 			"txpool-multi-view-listener-task-controller",
 			CONTROLLER_QUEUE_WARN_SIZE,
 		);
-		let task = Self::task(external_controllers.clone(), rx, events_metrics_collector);
+		let task = Self::task(
+			external_controllers.clone(),
+			external_status_sinks.clone(),
+			rx,
+			events_metrics_collector,
+		);
 
-		(Self { external_controllers, controller: tx }, task.boxed())
+		(Self { external_controllers, external_status_sinks, controller: tx }, task.boxed())
 	}
 
 	/// Creates an external tstream of events for given transaction.
@@ -589,19 +708,19 @@ where
 
 		Some(
 			futures::stream::unfold(external_ctx, |mut ctx| async move {
-				if ctx.terminate {
-					trace!(target: LOG_TARGET, tx_hash = ?ctx.tx_hash, "terminate");
-					return None
+				if ctx.state.terminate {
+					trace!(target: LOG_TARGET, tx_hash = ?ctx.state.tx_hash, "terminate");
+					return None;
 				}
 				loop {
 					tokio::select! {
 						cmd = ctx.command_receiver.next() => {
 							match cmd? {
 								ExternalWatcherCommand::ViewTransactionStatus(view_hash, status) => {
-									if let Some(new_status) = ctx.handle_view_transaction_status(view_hash, status) {
+									if let Some(new_status) = ctx.state.handle_view_transaction_status(view_hash, status) {
 										trace!(
 											target: LOG_TARGET,
-											tx_hash = ?ctx.tx_hash,
+											tx_hash = ?ctx.state.tx_hash,
 											?new_status,
 											"mvl sending out"
 										);
@@ -609,10 +728,10 @@ where
 									}
 								},
 								ExternalWatcherCommand::PoolTransactionStatus(request) => {
-									if let Some(new_status) = ctx.handle_pool_transaction_status(request) {
+									if let Some(new_status) = ctx.state.handle_pool_transaction_status(&request) {
 										trace!(
 											target: LOG_TARGET,
-											tx_hash = ?ctx.tx_hash,
+											tx_hash = ?ctx.state.tx_hash,
 											?new_status,
 											"mvl sending out"
 										);
@@ -620,10 +739,10 @@ where
 									}
 								}
 								ExternalWatcherCommand::AddView(h) => {
-									ctx.add_view(h);
+									ctx.state.add_view(h);
 								},
 								ExternalWatcherCommand::RemoveView(h) => {
-									ctx.remove_view(h);
+									ctx.state.remove_view(h);
 								},
 							}
 						},
@@ -632,6 +751,16 @@ where
 			})
 			.boxed(),
 		)
+	}
+
+	/// Creates a stream of transaction status updates for all transactions in the pool.
+	pub(crate) fn transaction_status_stream(
+		&self,
+	) -> TransactionStatusEventStream<ExtrinsicHash<ChainApi>, BlockHash<ChainApi>> {
+		const STATUS_STREAM_BUFFER_SIZE: usize = 1024;
+		let (sender, receiver) = channel(STATUS_STREAM_BUFFER_SIZE);
+		self.external_status_sinks.write().push(sender);
+		receiver
 	}
 
 	/// Adds an aggregated view's transaction status stream.

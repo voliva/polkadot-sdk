@@ -256,4 +256,15 @@ where
 
 		spawn_subscription_task(&self.executor, fut);
 	}
+
+	fn watch_mempool(&self, pending: PendingSubscriptionSink) {
+		let stream = self.pool.transaction_status_stream();
+		let fut = async move {
+			PendingSubscription::from(pending)
+				.pipe_from_stream(stream, BoundedVecDeque::default())
+				.await;
+		};
+
+		spawn_subscription_task(&self.executor, fut);
+	}
 }

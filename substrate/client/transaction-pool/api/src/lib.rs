@@ -189,9 +189,23 @@ impl<Hash, BlockHash> TransactionStatus<Hash, BlockHash> {
 	}
 }
 
+/// Transaction status update for a specific transaction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionStatusEvent<Hash, BlockHash> {
+	/// Hash of the transaction.
+	pub hash: Hash,
+	/// Current status of the transaction.
+	pub status: TransactionStatus<Hash, BlockHash>,
+}
+
 /// The stream of transaction events.
 pub type TransactionStatusStream<Hash, BlockHash> =
 	dyn Stream<Item = TransactionStatus<Hash, BlockHash>> + Send;
+
+/// The stream of transaction events for all transactions in the pool.
+pub type TransactionStatusEventStream<Hash, BlockHash> =
+	futures::channel::mpsc::Receiver<TransactionStatusEvent<Hash, BlockHash>>;
 
 /// The import notification event stream.
 pub type ImportNotificationStream<H> = futures::channel::mpsc::Receiver<H>;
@@ -204,6 +218,8 @@ pub type BlockHash<P> = <<P as TransactionPool>::Block as BlockT>::Hash;
 pub type TransactionFor<P> = <<P as TransactionPool>::Block as BlockT>::Extrinsic;
 /// Type of transactions event stream for a pool.
 pub type TransactionStatusStreamFor<P> = TransactionStatusStream<TxHash<P>, BlockHash<P>>;
+/// Type of transaction status event stream for a pool.
+pub type TransactionStatusEventStreamFor<P> = TransactionStatusEventStream<TxHash<P>, BlockHash<P>>;
 /// Transaction type for a local pool.
 pub type LocalTransactionFor<P> = <<P as LocalTransactionPool>::Block as BlockT>::Extrinsic;
 /// Transaction's index within the block in which it was included.
@@ -327,6 +343,9 @@ pub trait TransactionPool: Send + Sync {
 	// *** logging / RPC / networking
 	/// Return an event stream of transactions imported to the pool.
 	fn import_notification_stream(&self) -> ImportNotificationStream<TxHash<Self>>;
+
+	/// Return a stream of status updates for all transactions in the pool.
+	fn transaction_status_stream(&self) -> TransactionStatusEventStreamFor<Self>;
 
 	// *** networking
 	/// Notify the pool about transactions broadcast.

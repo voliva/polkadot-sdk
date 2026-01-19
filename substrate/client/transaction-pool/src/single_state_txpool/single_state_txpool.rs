@@ -416,6 +416,10 @@ where
 	) -> ReadyIteratorFor<PoolApi> {
 		self.ready_at_with_timeout_internal(at, timeout).await
 	}
+
+	fn transaction_status_stream(&self) -> sc_transaction_pool_api::TransactionStatusEventStreamFor<Self> {
+		todo!()
+	}
 }
 
 impl<Block, Client> BasicPool<FullChainApi<Client, Block>, Block>

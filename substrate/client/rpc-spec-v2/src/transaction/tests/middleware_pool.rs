@@ -21,7 +21,8 @@ use codec::Encode;
 use sc_transaction_pool::BasicPool;
 use sc_transaction_pool_api::{
 	ImportNotificationStream, PoolStatus, ReadyTransactions, TransactionFor, TransactionPool,
-	TransactionSource, TransactionStatusStreamFor, TxHash, TxInvalidityReportMap,
+	TransactionSource, TransactionStatusEventStreamFor, TransactionStatusStreamFor, TxHash,
+	TxInvalidityReportMap,
 };
 
 use crate::hex_string;
@@ -151,6 +152,10 @@ impl TransactionPool for MiddlewarePool {
 
 	fn import_notification_stream(&self) -> ImportNotificationStream<TxHash<Self>> {
 		self.inner_pool.import_notification_stream()
+	}
+
+	fn transaction_status_stream(&self) -> TransactionStatusEventStreamFor<Self> {
+		self.inner_pool.transaction_status_stream()
 	}
 
 	fn hash_of(&self, xt: &TransactionFor<Self>) -> TxHash<Self> {

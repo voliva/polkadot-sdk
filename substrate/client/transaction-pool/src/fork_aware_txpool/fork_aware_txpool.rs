@@ -59,7 +59,7 @@ use prometheus_endpoint::Registry as PrometheusRegistry;
 use sc_transaction_pool_api::{
 	error::Error as TxPoolApiError, ChainEvent, ImportNotificationStream,
 	MaintainedTransactionPool, PoolStatus, TransactionFor, TransactionPool, TransactionSource,
-	TransactionStatusStreamFor, TxHash, TxInvalidityReportMap,
+	TransactionStatusEventStreamFor, TransactionStatusStreamFor, TxHash, TxInvalidityReportMap,
 };
 use sp_blockchain::{HashAndNumber, TreeRoute};
 use sp_core::traits::SpawnEssentialNamed;
@@ -1078,6 +1078,11 @@ where
 	/// pending transactions in the right order.
 	fn import_notification_stream(&self) -> ImportNotificationStream<ExtrinsicHash<ChainApi>> {
 		self.import_notification_sink.event_stream()
+	}
+
+	/// Return a stream of status updates for all transactions in the pool.
+	fn transaction_status_stream(&self) -> TransactionStatusEventStreamFor<Self> {
+		self.view_store.listener.transaction_status_stream()
 	}
 
 	/// Returns the hash of a given transaction.

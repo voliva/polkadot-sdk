@@ -207,6 +207,23 @@ impl<B: ChainApi, L: EventHandler<B>> ValidatedPool<B, L> {
 		Self::new_with_rotator(options, is_validator, api, PoolRotator::new(ban_time), None)
 	}
 
+	/// Create a new transaction pool with statically sized rotator and event handler.
+	pub fn new_with_staticly_sized_rotator_and_event_handler(
+		options: Options,
+		is_validator: IsValidator,
+		api: Arc<B>,
+		event_handler: L,
+	) -> Self {
+		let ban_time = options.ban_time;
+		Self::new_with_rotator(
+			options,
+			is_validator,
+			api,
+			PoolRotator::new(ban_time),
+			Some(event_handler),
+		)
+	}
+
 	/// Create a new transaction pool.
 	pub fn new(options: Options, is_validator: IsValidator, api: Arc<B>) -> Self {
 		let ban_time = options.ban_time;

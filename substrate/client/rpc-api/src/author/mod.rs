@@ -20,7 +20,7 @@
 
 use error::Error;
 use jsonrpsee::proc_macros::rpc;
-use sc_transaction_pool_api::TransactionStatus;
+use sc_transaction_pool_api::{TransactionStatus, TransactionStatusEvent};
 use sp_core::Bytes;
 
 pub mod error;
@@ -103,4 +103,12 @@ pub trait AuthorApi<Hash, BlockHash> {
 		item = TransactionStatus<Hash, BlockHash>,
 	)]
 	fn watch_extrinsic(&self, bytes: Bytes);
+
+	/// Subscribe to all transaction status updates in the pool.
+	#[subscription(
+		name = "author_subscribeMempool" => "author_mempoolUpdate",
+		unsubscribe = "author_unsubscribeMempool",
+		item = TransactionStatusEvent<Hash, BlockHash>,
+	)]
+	fn watch_mempool(&self);
 }
